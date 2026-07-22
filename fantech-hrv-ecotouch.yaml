@@ -1,0 +1,564 @@
+# Fantech Hero HRV — ESPHome controller firmware
+#
+# Replaces the Fantech ECO-Touch wall controller. Acts as Modbus RTU master
+# on the HRV's RS-485 bus, exposing mode control and diagnostics to Home
+# Assistant via the ESPHome native API, with a local display showing current
+# mode and a three-button physical interface.
+#
+# Hardware (as built):
+
+# https://shop.m5stack.com/products/m5stack-station-esp32-iot-development-kit-rs485-version?variant=43165398827265
+#   - ESP32 dev board with AXP192 power management IC
+#   - ST7789V 135×240 LCD (SPI)
+#   - RS-485 transceiver on UART0 (GPIO1 TX / GPIO3 RX), flow control GPIO2
+#   - Three physical buttons on GPIO37 / GPIO38 / GPIO39 (input-only pins)
+#   - AXP192 PEK button used as power/toggle
+#
+# Modbus protocol (Fantech Hero, address 0x1, 9600 8N1):
+#   Mode register 0x3E (U_WORD):
+#     Off=2  Vent Low=3  Vent Med=4  Vent High=5  Timed Max=6
+#     Recirc Low=7  Recirc Med=8  Recirc High=9
+#   High timer register 0x34 (U_WORD, unit: seconds, max 43200 / 720 min)
+#     HRV counts down internally; controller must restore prior mode on expiry.
+#
+# Attribution:
+#   Protocol reverse-engineered by Dustin Thomas:
+#   https://dustint.com/post/2024-07-30-fantech-hrv/
+#   This implementation developed with Claude (Anthropic) — https://claude.ai
+#
+# Setup:
+#   Add to your ESPHome secrets.yaml:
+#     wifi_ssid: "YourSSID"
+#     wifi_password: "YourPassword"
+#     ota_password: "YourOTAPassword"
+
+substitutions:
+  friendly_name: Fantech HRV
+  mode_off: "Off"
+  mode_vent_low: "Vent Low"
+  mode_vent_medium: "Vent Medium"
+  mode_vent_high: "Vent High"
+  mode_timed_max: "Timed Max"
+  mode_recirc_low: "Recirc Low"
+  mode_recirc_medium: "Recirc Medium"
+  mode_recirc_high: "Recirc High"
+
+esphome:
+  name: hrv-bedrooms
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: 600
+    then:
+      - lambda: |-
+          // AXP192: enable LDO3 for display backlight
+          // Set LDO3 voltage to 3.0V (register 0x28, bits[3:0] = 0x0C)
+          uint8_t reg, vol;
+          reg = 0x28;
+          id(internal_i2c)->write(0x34, &reg, 1, false);
+          id(internal_i2c)->read(0x34, &vol, 1);
+          vol = (vol & 0xF0) | 0x0C;
+          uint8_t vol_buf[2] = {0x28, vol};
+          id(internal_i2c)->write(0x34, vol_buf, 2);
+          // Enable LDO3 output (register 0x12, bit 3)
+          uint8_t pwr;
+          reg = 0x12;
+          id(internal_i2c)->write(0x34, &reg, 1, false);
+          id(internal_i2c)->read(0x34, &pwr, 1);
+          pwr |= 0x08;
+          uint8_t pwr_buf[2] = {0x12, pwr};
+          id(internal_i2c)->write(0x34, pwr_buf, 2);
+          // Clear AXP192 PEK status register on boot so stale press isn't detected
+          uint8_t clr[2] = {0x46, 0x02};
+          id(internal_i2c)->write(0x34, clr, 2);
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# UART0 (GPIO1/GPIO3) is used for RS485 — disable serial logging
+logger:
+  baud_rate: 0
+
+api:
+  services:
+    # Call from HA to activate Timed Max for a given number of minutes.
+    # Saves the current mode so it can be restored when the timer expires.
+    - service: timed_max
+      variables:
+        time_minutes: int
+      then:
+        - globals.set:
+            id: timed_max_expiry_state
+            value: !lambda |-
+              auto select = id(hrv_mode);
+              auto index_opt = select->active_index();
+              if (index_opt.has_value() && select->current_option() != "${mode_timed_max}") {
+                return index_opt.value();
+              } else {
+                return static_cast<unsigned int>(0);
+              }
+        - number.set:
+            id: hrv_high_timer
+            value: !lambda 'return time_minutes;'
+        - select.set:
+            id: hrv_mode
+            option: ${mode_timed_max}
+
+ota:
+  platform: esphome
+  password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+globals:
+  - id: timed_max_expiry_state
+    type: unsigned int
+    restore_value: no
+    initial_value: '0'
+  - id: last_active_mode
+    type: unsigned int
+    restore_value: no
+    initial_value: '1'  # Vent Low
+  - id: modbus_last_ok
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: active_btn
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: power_btn_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+time:
+  - platform: sntp
+    on_time:
+      # Watchdog: if timer expired but mode is still Timed Max, restore previous mode.
+      # The HRV normally handles countdown itself, but this catches edge cases where
+      # the on_value handler misses the zero crossing.
+      - seconds: 0
+        minutes: /5
+        then:
+          - lambda: |-
+              if (id(hrv_high_timer)->state == 0 && id(hrv_mode)->current_option() == "${mode_timed_max}") {
+                auto call = id(hrv_mode).make_call();
+                call.set_index(id(timed_max_expiry_state));
+                call.perform();
+              }
+
+# Internal I2C bus: AXP192 power management, BM8563 RTC, INA3221 current monitor
+i2c:
+  id: internal_i2c
+  sda: GPIO21
+  scl: GPIO22
+
+uart:
+  id: mod_bus
+  tx_pin: GPIO1
+  rx_pin: GPIO3
+  baud_rate: 9600
+  stop_bits: 1
+  rx_buffer_size: 1500
+
+modbus:
+  uart_id: mod_bus
+  flow_control_pin: GPIO2
+  send_wait_time: 100ms
+  id: fantech_hrv
+
+modbus_controller:
+  - id: fantech_device
+    address: 0x1
+    modbus_id: fantech_hrv
+    setup_priority: -10
+    update_interval: 10s
+
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          // AXP192 PEK short press: register 0x46 bit 1 (M5Stack convention)
+          uint8_t reg = 0x46;
+          id(internal_i2c)->write(0x34, &reg, 1, false);
+          uint8_t status;
+          id(internal_i2c)->read(0x34, &status, 1);
+          if (!(status & 0x02)) return;
+          // Clear the latch immediately
+          uint8_t clr[2] = {0x46, 0x02};
+          id(internal_i2c)->write(0x34, clr, 2);
+          id(active_btn) = 0;
+          // Toggle on/off, remembering last active mode
+          auto current = id(hrv_mode)->current_option();
+          if (current == "${mode_off}") {
+            auto call = id(hrv_mode).make_call();
+            call.set_index(id(last_active_mode));
+            call.perform();
+          } else {
+            id(last_active_mode) = id(hrv_mode)->active_index().value_or(1);
+            auto call = id(hrv_mode).make_call();
+            call.set_option("${mode_off}");
+            call.perform();
+          }
+          id(power_btn_pending) = true;
+      - if:
+          condition:
+            lambda: return id(power_btn_pending);
+          then:
+            - lambda: id(power_btn_pending) = false;
+            - homeassistant.event:
+                event: esphome.hrv_button_pressed
+                data:
+                  device: hrv_bedrooms
+
+# Physical buttons — GPIO37-39 are input-only on ESP32, no internal pull-up available
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO37
+      inverted: true
+      mode:
+        input: true
+    id: btn_a
+    internal: true
+    on_press:
+      then:
+        - lambda: id(active_btn) = 1;
+        - homeassistant.event:
+            event: esphome.hrv_button_pressed
+            data:
+              device: hrv_bedrooms
+        - select.set:
+            id: hrv_mode
+            option: "${mode_vent_low}"
+
+  - platform: gpio
+    pin:
+      number: GPIO38
+      inverted: true
+      mode:
+        input: true
+    id: btn_b
+    internal: true
+    on_press:
+      then:
+        - lambda: id(active_btn) = 2;
+        - homeassistant.event:
+            event: esphome.hrv_button_pressed
+            data:
+              device: hrv_bedrooms
+        - select.set:
+            id: hrv_mode
+            option: "${mode_vent_medium}"
+
+  - platform: gpio
+    pin:
+      number: GPIO39
+      inverted: true
+      mode:
+        input: true
+    id: btn_c
+    internal: true
+    on_press:
+      then:
+        - lambda: id(active_btn) = 3;
+        - homeassistant.event:
+            event: esphome.hrv_button_pressed
+            data:
+              device: hrv_bedrooms
+        - select.set:
+            id: hrv_mode
+            option: "${mode_vent_high}"
+
+# SPI bus for ST7789V2 display
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO23
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_label
+    size: 18
+  - file: "gfonts://Roboto"
+    id: font_mode
+    size: 36
+  - file: "gfonts://Roboto"
+    id: font_btn
+    size: 18
+
+display:
+  - platform: ili9xxx
+    model: ST7789V
+    cs_pin: GPIO5
+    dc_pin: GPIO19
+    reset_pin: GPIO15
+    invert_colors: true
+    # Native panel is 135×240 portrait; rotate to 240×135 landscape
+    rotation: 90
+    dimensions:
+      width: 135
+      height: 240
+      offset_width: 52
+      offset_height: 40
+    lambda: |-
+      it.fill(Color::BLACK);
+      it.printf(4, 4, id(font_label), Color(0x88, 0x88, 0x88), "Bedroom HRV");
+      bool comms_ok = id(modbus_last_ok) > 0 && (millis() - id(modbus_last_ok)) < 90000;
+      if (!comms_ok) {
+        it.printf(4, 28, id(font_mode), Color(0xFF, 0x44, 0x00), "No Comms");
+      } else {
+        it.printf(4, 28, id(font_mode), Color::WHITE, "%s", id(hrv_mode)->state.c_str());
+      }
+      if (comms_ok && id(hrv_mode)->state == "${mode_timed_max}") {
+        it.printf(4, 72, id(font_label), Color(0xFF, 0xCC, 0x00),
+          "Timer: %d min", (int)id(hrv_high_timer).state);
+      }
+      // Button bar — active button inverted to show physical vs HA control
+      it.filled_rectangle(0, 112, 240, 23, Color(0x22, 0x22, 0x22));
+      if (id(active_btn) == 1) it.filled_rectangle(  0, 112, 80, 23, Color::WHITE);
+      if (id(active_btn) == 2) it.filled_rectangle( 80, 112, 80, 23, Color::WHITE);
+      if (id(active_btn) == 3) it.filled_rectangle(160, 112, 80, 23, Color::WHITE);
+      it.printf(  6, 115, id(font_btn), id(active_btn) == 1 ? Color::BLACK : Color(0xAA, 0xAA, 0xFF), "Low");
+      it.printf( 86, 115, id(font_btn), id(active_btn) == 2 ? Color::BLACK : Color(0xAA, 0xFF, 0xAA), "Med");
+      it.printf(166, 115, id(font_btn), id(active_btn) == 3 ? Color::BLACK : Color(0xFF, 0xAA, 0xAA), "High");
+
+select:
+  - platform: modbus_controller
+    modbus_controller_id: fantech_device
+    id: hrv_mode
+    name: "Mode"
+    address: 0x3E
+    value_type: U_WORD
+    optionsmap:
+      "${mode_off}": 2
+      "${mode_vent_low}": 3
+      "${mode_vent_medium}": 4
+      "${mode_vent_high}": 5
+      "${mode_timed_max}": 6
+      "${mode_recirc_low}": 7
+      "${mode_recirc_medium}": 8
+      "${mode_recirc_high}": 9
+    on_value:
+      then:
+        - lambda: |-
+            // Clear button highlight if HA changed to a mode that doesn't match it
+            uint8_t btn = id(active_btn);
+            if (btn > 0) {
+              bool match = (btn == 1 && x == "${mode_vent_low}") ||
+                           (btn == 2 && x == "${mode_vent_medium}") ||
+                           (btn == 3 && x == "${mode_vent_high}");
+              if (!match) id(active_btn) = 0;
+            }
+            if (x != "${mode_timed_max}") {
+              id(timed_max_expiry_state) = 0;
+              auto call = id(hrv_high_timer).make_call();
+              call.set_value(0);
+              call.perform();
+            }
+
+number:
+  # Timed max duration. HRV stores value in seconds; multiply:60 converts minutes↔seconds.
+  - platform: modbus_controller
+    modbus_controller_id: fantech_device
+    id: hrv_high_timer
+    name: "High Timer"
+    address: 0x34
+    value_type: U_WORD
+    unit_of_measurement: minutes
+    min_value: 0
+    max_value: 720
+    multiply: 60
+    entity_category: diagnostic
+    on_value:
+      then:
+        - lambda: |-
+            if (x == 0 && id(hrv_mode)->current_option() == "${mode_timed_max}") {
+              auto call = id(hrv_mode).make_call();
+              call.set_index(id(timed_max_expiry_state));
+              id(timed_max_expiry_state) = 0;
+              call.perform();
+            }
+
+  # Airflow balancing. Register encodes offset from 100% using two's complement-style:
+  # 0 = 100%, otherwise value = 65536 - (100 - percent).
+  - platform: modbus_controller
+    modbus_controller_id: fantech_device
+    id: exhaust_fan_speed
+    name: "Exhaust Fan Speed"
+    address: 0x13
+    skip_updates: 20
+    value_type: U_WORD
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 50
+    max_value: 100
+    lambda: |-
+      if (x == 0) {
+        return 100;
+      } else {
+        return 100 - (65536 - x);
+      }
+    write_lambda: |-
+      if (x == 100) {
+        return 0;
+      } else {
+        return 65536 - (100 - x);
+      }
+
+  - platform: modbus_controller
+    modbus_controller_id: fantech_device
+    id: intake_fan_speed
+    name: "Intake Fan Speed"
+    address: 0x12
+    skip_updates: 20
+    value_type: U_WORD
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 50
+    max_value: 100
+    lambda: |-
+      if (x == 0) {
+        return 100;
+      } else {
+        return 100 - (65536 - x);
+      }
+    write_lambda: |-
+      if (x == 100) {
+        return 0;
+      } else {
+        return 65536 - (100 - x);
+      }
+
+sensor:
+  - platform: modbus_controller
+    modbus_controller_id: fantech_device
+    id: intake_temp
+    name: "Intake Temperature"
+    register_type: holding
+    address: 0x2F
+    value_type: S_WORD
+    entity_category: diagnostic
+    skip_updates: 2
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    on_value:
+      then:
+        - globals.set:
+            id: modbus_last_ok
+            value: !lambda 'return millis();'
+
+  # Diagnostic registers with unknown meaning — retained for investigation
+  - platform: modbus_controller
+    modbus_controller_id: fantech_device
+    name: "0x04"
+    register_type: holding
+    address: 0x04
+    value_type: U_WORD
+    entity_category: diagnostic
+    skip_updates: 5
+  - platform: modbus_controller
+    modbus_controller_id: fantech_device
+    name: "0x1F"
+    register_type: holding
+    address: 0x1F
+    value_type: U_WORD
+    entity_category: diagnostic
+    skip_updates: 5
+  - platform: modbus_controller
+    modbus_controller_id: fantech_device
+    name: "0x20"
+    register_type: holding
+    address: 0x20
+    value_type: U_WORD
+    entity_category: diagnostic
+    skip_updates: 5
+  - platform: modbus_controller
+    modbus_controller_id: fantech_device
+    name: "0x39"
+    register_type: holding
+    address: 0x39
+    value_type: U_WORD
+    entity_category: diagnostic
+    skip_updates: 5
+  - platform: modbus_controller
+    modbus_controller_id: fantech_device
+    name: "0x5F"
+    register_type: holding
+    address: 0x5F
+    value_type: U_WORD
+    entity_category: diagnostic
+    skip_updates: 5
+  - platform: modbus_controller
+    modbus_controller_id: fantech_device
+    name: "0x60"
+    register_type: holding
+    address: 0x60
+    value_type: U_WORD
+    entity_category: diagnostic
+    skip_updates: 5
+  - platform: modbus_controller
+    modbus_controller_id: fantech_device
+    name: "0x62"
+    register_type: holding
+    address: 0x62
+    value_type: U_WORD
+    entity_category: diagnostic
+    skip_updates: 5
+
+  # Power draw estimated from measured current (0.5/0.83/1.1A at 120V)
+  - platform: template
+    name: "Power"
+    id: hrv_power
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      auto &m = id(hrv_mode)->state;
+      if (m == "${mode_vent_low}"    || m == "${mode_recirc_low}")    return 60.0f;
+      if (m == "${mode_vent_medium}" || m == "${mode_recirc_medium}") return 100.0f;
+      if (m == "${mode_vent_high}"   || m == "${mode_recirc_high}"
+                                     || m == "${mode_timed_max}")     return 132.0f;
+      return 0.0f;
+
+  - platform: integration
+    name: "Energy"
+    sensor: hrv_power
+    time_unit: h
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters:
+      - multiply: 0.001
+
+text_sensor:
+  # Actual current operating mode — may differ from hrv_mode if humidistat or
+  # defrost cycle has overridden the requested mode.
+  - platform: modbus_controller
+    modbus_controller_id: fantech_device
+    name: "Current Mode"
+    register_type: holding
+    address: 0x28
+    raw_encode: HEXBYTES
+    entity_category: diagnostic
+    lambda: |-
+      uint16_t value = modbus_controller::word_from_hex_str(x, 0);
+      switch (value) {
+        case 2: return std::string("${mode_off}");
+        case 3: return std::string("${mode_vent_low}");
+        case 4: return std::string("${mode_vent_medium}");
+        case 5: return std::string("${mode_vent_high}");
+        case 6: return std::string("${mode_timed_max}");
+        case 7: return std::string("${mode_recirc_low}");
+        case 8: return std::string("${mode_recirc_medium}");
+        case 9: return std::string("${mode_recirc_high}");
+        default: return std::string("Unknown (") + std::to_string(value) + std::string(")");
+      }
+      return x;
