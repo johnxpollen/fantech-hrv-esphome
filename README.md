@@ -85,7 +85,7 @@ Fan speed registers use a two's complement-style encoding:
 Disconnect the Eco-touch and move the wires to the bottom port on the M5Stack Station:
 
 D+ -> (red)V  12v
-down-arrow -> (black)G  ground
+↓ -> (black)G  ground
 A -> A
 B -> B (swap these two if no comms)
 ```
