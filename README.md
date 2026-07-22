@@ -10,6 +10,7 @@ no additional wiring.
 ## Attribution
 
 The Modbus protocol for the Fantech Hero was reverse-engineered by **Dustin Thomas**:
+This code is derived from his work:
 
 > https://dustint.com/post/2024-07-30-fantech-hrv/
 
@@ -85,7 +86,7 @@ D+ -> (red)V  12v
 down-arrow -> (black)G  ground
 A -> A
 B -> B (swap these two if no comms)
-
+```
 
 ## Known Unknowns
 
