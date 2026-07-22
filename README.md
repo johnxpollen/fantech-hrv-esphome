@@ -1,3 +1,5 @@
+![M5Stack Station](IMG_1839.jpeg)
+
 # Fantech Hero HRV — ESPHome Controller
 
 ESPHome firmware that replaces the Fantech ECO-Touch wall controller on a
